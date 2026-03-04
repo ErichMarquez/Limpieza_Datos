@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+
+#Definir sobre que sucursal se trabajará
+indice_sucursal=2
 
 #Agregación del histórico
 hist_2023=pd.read_csv('Ventas 2023.csv',header=None)
@@ -25,8 +27,6 @@ hist_23_25_semanal=(
 )
 
 hist_23_25_comp=hist_23_25_semanal[['SKU','fecha','ventas','sucursal','producto']].sort_values(by=['fecha','SKU']).reset_index(drop=True)
-cuenta_dup=hist_23_25_comp.groupby(['sucursal','SKU','fecha']).size()
-n_duplicados=(cuenta_dup>1).sum()
 
 #Eliminación de SKUs Temporales
 exclusiones=pd.read_csv('Exclusiones.txt')
@@ -82,8 +82,6 @@ Hist_Final=Hist_Final.sort_values(by=['fecha','sucursal','SKU']).reset_index(dro
 import utilsforecast as utils
 from utilsforecast.preprocessing import fill_gaps
 from datetime import datetime
-#Crear la definición de la función a usar
-indice_sucursal=2
 
 Historico_Sucursal=Hist_Final[Hist_Final['sucursal']==indice_sucursal].drop(columns='sucursal').reset_index(drop=True)
 
@@ -99,9 +97,48 @@ His_Sucursal_Semanales=fill_gaps(
 His_Sucursal_Semanales['ventas']=His_Sucursal_Semanales['ventas'].fillna(0)
 His_Sucursal_Semanales['producto']=His_Sucursal_Semanales.groupby('SKU')['producto'].ffill()
 
+#Se agrega nuevo preprocessing: Filtración de productos descontinuados
+semanas_sin_venta=16 #Hasta 4 meses sin que se resurta o venda un item
+
+Historico_Sucursal=His_Sucursal_Semanales.copy()
+Historico_Sucursal['fecha']=pd.to_datetime(Historico_Sucursal['fecha'])
+fecha_corte=Historico_Sucursal["fecha"].max()
+ventana=pd.Timedelta(weeks=semanas_sin_venta)
+fecha_inicio_ventana=fecha_corte-ventana
+
+ventas_recientes=(
+    Historico_Sucursal[Historico_Sucursal["fecha"] >= fecha_inicio_ventana]
+    .groupby("SKU")
+    .agg({"ventas": "sum"})
+    .reset_index()
+    .rename(columns={"ventas": "ventas_recientes"})
+).fillna(0)
+
+todos_SKUs=Historico_Sucursal[["SKU"]].drop_duplicates().reset_index(drop=True)
+
+ventas_recientes=pd.merge(
+    todos_SKUs,
+    ventas_recientes,
+    on="SKU",
+    how="left"
+)
+
+mask_descontinuados=(ventas_recientes["ventas_recientes"]==0)
+skus_activos=ventas_recientes.loc[~mask_descontinuados,"SKU"].tolist()
+skus_descontinuados=ventas_recientes.loc[mask_descontinuados,"SKU"].tolist()
+
+df_activo=Historico_Sucursal[Historico_Sucursal["SKU"].isin(skus_activos)].copy().reset_index(drop=True)
+df_descontinuado=Historico_Sucursal[Historico_Sucursal["SKU"].isin(skus_descontinuados)].copy().reset_index(drop=True)
+
+df_descontinuado.to_parquet(f"{Subrutas["metadatos"]}/skus_descontinuados.parquet",index=False)
+
+His_Sucursal_Semanales=df_activo.copy()
+
+#Nuevas selecciones de categoria
 LI_Sem=13
-LS_Sem=26
-Porc_ML=0.65
+LMin_CV=26
+LS_Sem=110
+Porc_ML=0.70
 Porc_Intermitente=0.2
 
 His_Sucursal_Semanales['Venta Binaria']=(His_Sucursal_Semanales['ventas']>0).astype(int)
@@ -122,11 +159,11 @@ Contador_Ventas['Porcentaje_Ventas']=Contador_Ventas['Semanas_Con_Venta']/Contad
 Contador_Ventas['Modelo Seleccionado']=np.select(
     [
         (Contador_Ventas['Semanas_Con_Venta']>LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']>Porc_ML),
-        (Contador_Ventas['Semanas_Con_Venta']>=LI_Sem) & (Contador_Ventas['Semanas_Con_Venta']<=LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']>Porc_ML),
+        (Contador_Ventas['Semanas_Con_Venta']>=LMin_CV) & (Contador_Ventas['Semanas_Con_Venta']<=LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']>Porc_ML),
         (Contador_Ventas['Semanas_Con_Venta']>LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']<=Porc_ML) & (Contador_Ventas['Porcentaje_Ventas']>Porc_Intermitente),
         (Contador_Ventas['Semanas_Con_Venta']>=LI_Sem) & (Contador_Ventas['Semanas_Con_Venta']<=LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']<=Porc_ML) & (Contador_Ventas['Porcentaje_Ventas']>Porc_Intermitente)
     ],
-    ['MLForecast','MLForecast','Método Intermitente','Método Intermitente'],
+    ['MLForecast','Método Intermitente','Método Intermitente','Método Intermitente'],
     default='Sin pronóstico'
 )
 
@@ -137,8 +174,8 @@ SKU_ML=Contador_Ventas[Contador_Ventas['Modelo Seleccionado']=='MLForecast']
 #Extracción de Datos de Entrenamiento
 df_ML=His_Sucursal_Semanales[His_Sucursal_Semanales['SKU'].isin(SKU_ML['SKU'])].drop(columns='Venta Binaria').rename(columns={'fin_calendario':'fin_prom'}).copy().reset_index(drop=True)
 
-df_ML.to_csv('ML sucursal '+str(indice_sucursal)+'.csv',index=0)
+df_ML.to_csv('ML sucursal '+str(indice_sucursal)+'.csv',index=False)
 
 df_Intermitentes=His_Sucursal_Semanales[His_Sucursal_Semanales['SKU'].isin(SKU_Intermitentes['SKU'])].drop(columns='Venta Binaria').rename(columns={'fin_calendario':'fin_prom'}).copy().reset_index(drop=True)
 
-df_Intermitentes.to_csv('Intermitentes sucursal '+str(indice_sucursal)+'.csv',index=0)
+df_Intermitentes.to_csv('Intermitentes sucursal '+str(indice_sucursal)+'.csv',index=False)
