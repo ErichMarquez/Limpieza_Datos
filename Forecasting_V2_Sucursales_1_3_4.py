@@ -137,132 +137,201 @@ def cargar_csv(
     print(f"CSV ML cargado SKUs: {len(df_ML['unique_id'].unique()):,}")
 
     return df_intermitente,df_ML
-
-!pip install statsforecast
-from statsforecast import StatsForecast
-from statsforecast.models import AutoETS, AutoTheta,CrostonOptimized
+    
+!pip install mlforecast lightgbm
 
 #Inicio de entrenamiento y pronóstico de Intermitentes
+from mlforecast import MLForecast
+from mlforecast.lag_transforms import RollingMean, RollingStd
+from lightgbm import LGBMRegressor
+
 def entrenar_adida(
     df_intermitente: pd.DataFrame,
     horizonte: int=horizonte,
-) ->StatsForecast:
+) ->MLForecast:
+
     df_model=df_intermitente[["unique_id","ds","y"]].copy()
+    df_model["unique_id"]=df_model["unique_id"].astype(int)
 
-    modelos=[
-        AutoETS(season_length=52),
-        AutoTheta(season_length=52),
-        CrostonOptimized()
-        ]
+    #Features específicas para demanda intermitente
+    # Proporción de semanas con ventas por SKU
+    df_model["prop_ventas"]=(
+        df_model.groupby("unique_id")["y"]
+        .transform(lambda x:(x.shift(1)>0).expanding().mean())
+    )
 
-    sf=StatsForecast(
-        models=modelos,
+    #Semanas desde la última demanda positiva
+    def semanas_desde_ultima_venta(serie):
+        result=[]
+        contador=0
+        for val in serie.shift(1).fillna(0):
+            if val>0:
+                contador=0
+            else:
+                contador+=1
+            result.append(contador)
+        return pd.Series(result, index=serie.index)
+
+    df_model["semanas_sin_venta"] = (
+        df_model.groupby("unique_id")["y"]
+        .transform(semanas_desde_ultima_venta)
+    )
+
+    lags=[4,8,12,52]
+
+    lag_transforms={
+        4: [RollingMean(window_size=4),RollingStd(window_size=4)],
+        8: [RollingMean(window_size=8)],
+        12: [RollingMean(window_size=12)]
+     }
+
+    mlf = MLForecast(
+        models={
+            "lgbm_intermitente": LGBMRegressor(
+                objective="tweedie",   # diseñado para distribuciones con muchos ceros
+                tweedie_variance_power=1.85,  # entre 1 (Poisson) y 2 (Gamma)
+                n_estimators=500,
+                learning_rate=0.05,
+                num_leaves=31,
+                max_depth=6,
+                min_child_samples=20,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=-1,
+                random_state=42,
+                verbose=-1
+            )
+        },
         freq=frecuencia,
-        n_jobs=-1,
-        fallback_model=CrostonOptimized()
+        lags=lags,
+        lag_transforms=lag_transforms
         )
-
     print("Ejecutando cross-validation")
-    cv_df=sf.cross_validation(
+    cv_df=mlf.cross_validation(
         df=df_model,
-        h=int(horizonte),
+        h=horizonte,
         n_windows=4,
-        step_size=int(horizonte),
-        fitted=False
+        step_size=horizonte,
+        fitted=True,
+        static_features=["unique_id"]
         )
 
-    modelos_cols=["AutoETS","AutoTheta","CrostonOptimized"]
-    cols_cv=[c for c in modelos_cols if c in cv_df.columns]
+    mae=(cv_df["lgbm_intermitente"]-cv_df["y"]).abs().mean()
+    rmse=np.sqrt(((cv_df["lgbm_intermitente"]-cv_df["y"])**2).mean())
 
-    metricas=[]
-    for col in cols_cv:
-      mae=(cv_df[col]-cv_df["y"]).abs().mean()
-      rmse=np.sqrt(((cv_df[col]-cv_df["y"])**2).mean())
-      metricas.append({"modelo":col,"MAE":round(mae,6),"RMSE":round(rmse,6)})
+    metricas_df=pd.DataFrame([{
+        "modelo":"LightGBM_Intermitente",
+        "MAE":round(mae,6),
+        "RMSE":round(rmse,6)
+    }])
 
-    metricas_df=pd.DataFrame(metricas)
-    metricas_df.to_parquet(f"{Subrutas['validacion']}/cv_metricas_intermitentes.parquet",index=False)
-    cv_df.to_parquet(f"{Subrutas['validacion']}/cv_detalle_intermitentes.parquet",index=False)
+    cv_por_sku=(
+        cv_df.groupby("unique_id")
+        .apply(lambda g: pd.Series({
+            "MAE": (g["lgbm_intermitente"]-g["y"]).abs().mean(),
+            "RMSE": np.sqrt(((g["lgbm_intermitente"]-g["y"])**2).mean()),
+            "bias": (g["lgbm_intermitente"]-g["y"]).mean()
+        }),include_groups=False)
+        .reset_index()
+    )
 
-    print(metricas_df.to_string(index=False))
+    skus_riesgosos=cv_por_sku[cv_por_sku["MAE"]>mae*1.5]
 
-    joblib.dump(sf,f"{Subrutas['modelos']}/sf_intermitentes.joblib")
+    if len(skus_riesgosos)>0:
+        print(f"Cantidad de SKUs con riesgo en el pronóstico de intermitentes: {len(skus_riesgosos)}, con un error 1.5 veces mayor al promedio ({mae:.2f})")
+        print(skus_riesgosos.sort_values("MAE", ascending=False).to_string())
+        skus_riesgosos.to_excel(f"{Subrutas['validacion']}/skus_riesgosos_Intermitentes_{mes}.xlsx",index=False)
+
+    metricas_df.to_parquet(f"{Subrutas['validacion']}/cv_metricas_intermitente.parquet", index=False)
+    cv_df.to_parquet(f"{Subrutas['validacion']}/cv_detalle_intermitente.parquet", index=False)
+    cv_por_sku.to_parquet(f"{Subrutas['validacion']}/cv_metricas_por_sku_intermitente.parquet", index=False)
+
+    mlf.fit(
+        df_model,
+        static_features=["unique_id"],
+        fitted=True
+        )
+    joblib.dump(mlf,f"{Subrutas['modelos']}/mlf_intermitentes.joblib")
     df_model.to_parquet(f"{Subrutas['modelos']}/df_intermitentes.parquet",index=False)
-
     joblib.dump({
         "fecha_entrenamiento":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "num_SKUs":df_intermitente["unique_id"].nunique(),
         "horizonte":horizonte,
         "freq":frecuencia,
-        "modelos":[type(m).__name__ for m in modelos],
         "metricas_cv":metricas_df.to_dict(orient="records"),
         "skus":df_intermitente["unique_id"].unique().tolist()
-    },f"{Subrutas['metadatos']}/metadatos_intermitentes.joblib")
+     },f"{Subrutas['metadatos']}/metadatos_intermitentes.joblib")
 
-    print("Modelo intermitente guardado en Drive")
-    return sf
+    print("Modelo Intermitente ML guardado en Drive")
+    return mlf
 
 #Pronóstico de Intermitentes
 def pronosticar_adida(
     df_intermitente: pd.DataFrame,
     horizonte: int=horizonte
 ) ->pd.DataFrame:
-  sf=joblib.load(f"{Subrutas['modelos']}/sf_intermitentes.joblib")
+
+  mlf=joblib.load(f"{Subrutas['modelos']}/mlf_intermitentes.joblib")
 
   if df_intermitente is None:
     df_model=pd.read_parquet(f"{Subrutas['modelos']}/df_intermitentes.parquet")
   else:
     df_model=df_intermitente[["unique_id","ds","y"]].copy()
 
-  forecast_df=sf.forecast(
-      df=df_model,
-      h=int(horizonte)
-  )
+  df_futuro=mlf.make_future_dataframe(h=horizonte)
+  df_futuro["unique_id"]=df_futuro["unique_id"].astype(int)
 
-  modelos_cols=["AutoETS","AutoTheta","CrostonOptimized"]
-  cols_forecast=[c for c in modelos_cols if c in forecast_df.columns]
+  ultima_prop=(
+      df_intermitente.assign(
+          prop_ventas=df_intermitente.groupby("unique_id")["y"].transform(lambda x: (x.shift(1)>0).expanding().mean())
+      )
+      .groupby("unique_id")["prop_ventas"].last().reset_index()
+      )
 
-  #Selección de mejor modelo según CrossValidation
-  cv_df=pd.read_parquet(f"{Subrutas['validacion']}/cv_detalle_intermitentes.parquet")
-  cols_cv=[c for c in modelos_cols if c in cv_df.columns]
+  ultima_prop["unique_id"] = ultima_prop["unique_id"].astype(int)
 
-  mae_por_sku=(
-      cv_df.groupby("unique_id")
-      .apply(lambda g: pd.Series({
-          col: (g[col]-g["y"]).abs().mean()
-          for col in cols_cv
-      }), include_groups=False)
+  def calculo_semanas_sin_venta_actual(grupo):
+      y=grupo.sort_values("ds")["y"].values
+      contador=0
+      for val in reversed(y):
+          if val>0:
+            break
+            contador+=1
+      return contador
+
+  ultimas_semanas=(
+      df_intermitente.groupby("unique_id")
+      .apply(calculo_semanas_sin_venta_actual,include_groups=False)
       .reset_index()
+      .rename(columns={0:"semanas_sin_venta"})
   )
-  mae_por_sku["mejor_modelo"]=mae_por_sku[cols_cv].idxmin(axis=1)
+  ultimas_semanas["unique_id"] = ultimas_semanas["unique_id"].astype(int)
 
-  forecast_df=forecast_df.merge(
-      mae_por_sku[["unique_id","mejor_modelo"]],
+  df_futuro=pd.merge(
+      df_futuro,
+      ultima_prop,
       on="unique_id",
       how="left"
   )
 
-  def elegir_pred(row: pd.Series) ->float:
-      modelo=row["mejor_modelo"]
-      if modelo and modelo in cols_forecast:
-          return max(row[modelo],0)
-      return max(pd.Series(row[c] for c in cols_forecast).mean(),0)
+  df_futuro=pd.merge(
+      df_futuro,
+      ultimas_semanas,
+      on="unique_id",
+      how="left"
+  )
 
-  forecast_df["y_pred"]=forecast_df.apply(elegir_pred,axis=1)
+  forecast_df=mlf.predict(h=horizonte,X_df=df_futuro)
+  forecast_df=forecast_df.rename(columns={"lgbm_intermitente":"y_pred"})
+  forecast_df["y_pred"]=forecast_df["y_pred"].clip(lower=0)
 
-  resultado=forecast_df[["unique_id","ds","y_pred","mejor_modelo"]+cols_forecast]
-  resultado.to_parquet(f"{Subrutas["pronosticos"]}/forecast_intermitente.parquet",index=False)
+  forecast_df.to_parquet(f"{Subrutas['pronosticos']}/forecast_intermitente.parquet",index=False)
 
-  return resultado
+  return forecast_df
+
 #Fin de entrenamiento y pronóstico de Intermitentes
 
 #Inicio de entrenamiento y pronóstico de Continuos
-!pip install mlforecast lightgbm
-
-from mlforecast import MLForecast
-from mlforecast.lag_transforms import RollingMean, RollingStd, RollingMax
-from lightgbm import LGBMRegressor
-
 def entrenar_mlforecast(
     df_ML: pd.DataFrame,
     horizonte: int=horizonte
@@ -499,7 +568,7 @@ def pipeline_completo(
         .reset_index(drop=True)
     )
 
-    reporte["Pronóstico de Ventas"]=np.ceil(reporte["Pronóstico de Ventas"])
+    reporte["Pronóstico de Ventas"]=np.round(reporte["Pronóstico de Ventas"])
     reporte.to_parquet(f"{Subrutas['pronosticos']}/reporte_total.parquet",index=False)
 
     reporte_excel=reporte.drop(columns=["Modelo"]).copy()
