@@ -5,11 +5,15 @@ import numpy as np
 indice_sucursal=2
 
 #Agregación del histórico
-hist_2023=pd.read_csv('Ventas 2023.csv',header=None)
-hist_2024=pd.read_csv('Ventas 2024.csv',header=None)
-hist_2025=pd.read_csv('Ventas 2025.csv',header=None)
-hist_23_25=pd.concat([hist_2023,hist_2024,hist_2025])
-hist_23_25.columns=['sucursal','SKU','producto','ventas','fecha']
+hist_23_25=pd.read_csv('Ventas_Historico.csv',header=None) #Aquí va el histórico desde 2023 hasta el domingo deseado de 2026
+hist_23_25.columns=['SKU','ventas','sucursal','fecha']
+hist_23_25=hist_23_25[hist_23_25['sucursal']==indice_sucursal].reset_index(drop=True)
+
+nombres=pd.read_csv('CatalogoProductos.csv') #Aquí va el inventario con el cual se cruzan los nombres
+nombres.columns=['Sucursal','SKU','producto','inventario']
+nombres=nombres[nombres['Sucursal']==indice_sucursal].drop(columns=['Sucursal','inventario']).reset_index(drop=True)
+hist_23_25=pd.merge(hist_23_25,nombres,on=['SKU'],how='left')
+#Como resultado se obtiene el dataframe con nombres incluidos, los formatos de los archivos son tal cual los obtenemos de las vistas.
 
 hist_23_25_sum=hist_23_25.groupby(['SKU','fecha','producto','sucursal'])['ventas'].sum().reset_index()
 hist_23_25_sum['fecha']=pd.to_datetime(hist_23_25_sum['fecha'],format="%Y-%m-%d")
@@ -77,7 +81,7 @@ Hist_Final['prom']=Hist_Final['prom'].fillna(hist_prom_gen['prom'])
 Hist_Final['fin_calendario']=Hist_Final['fin_calendario'].fillna(hist_prom_gen['fin_calendario'])
 Hist_Final=Hist_Final.sort_values(by=['fecha','sucursal','SKU']).reset_index(drop=True)
 
-#Extracción por sucursales
+#Agregado semanal en formato W_SUN
 !pip install utilsforecast
 import utilsforecast as utils
 from utilsforecast.preprocessing import fill_gaps
@@ -135,11 +139,9 @@ df_descontinuado.to_parquet(f"{Subrutas["metadatos"]}/skus_descontinuados.parque
 His_Sucursal_Semanales=df_activo.copy()
 
 #Nuevas selecciones de categoria
-LI_Sem=13
-LMin_CV=26
+LI_Sem=104
 LS_Sem=110
 Porc_ML=0.70
-Porc_Intermitente=0.2
 
 His_Sucursal_Semanales['Venta Binaria']=(His_Sucursal_Semanales['ventas']>0).astype(int)
 
@@ -158,12 +160,10 @@ Contador_Ventas=(
 Contador_Ventas['Porcentaje_Ventas']=Contador_Ventas['Semanas_Con_Venta']/Contador_Ventas['Semanas_Totales']
 Contador_Ventas['Modelo Seleccionado']=np.select(
     [
-        (Contador_Ventas['Semanas_Con_Venta']>LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']>Porc_ML),
-        (Contador_Ventas['Semanas_Con_Venta']>=LMin_CV) & (Contador_Ventas['Semanas_Con_Venta']<=LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']>Porc_ML),
-        (Contador_Ventas['Semanas_Con_Venta']>LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']<=Porc_ML) & (Contador_Ventas['Porcentaje_Ventas']>Porc_Intermitente),
-        (Contador_Ventas['Semanas_Con_Venta']>=LI_Sem) & (Contador_Ventas['Semanas_Con_Venta']<=LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']<=Porc_ML) & (Contador_Ventas['Porcentaje_Ventas']>Porc_Intermitente)
+        (Contador_Ventas['Semanas_Con_Venta']>=LS_Sem) & (Contador_Ventas['Porcentaje_Ventas']>=Porc_ML),
+        (Contador_Ventas['Semanas_Totales']>=LI_Sem) & (Contador_Ventas['Semanas_Con_Venta']<LS_Sem)
     ],
-    ['MLForecast','Método Intermitente','Método Intermitente','Método Intermitente'],
+    ['MLForecast','Método Intermitente'],
     default='Sin pronóstico'
 )
 
