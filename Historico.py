@@ -141,7 +141,7 @@ His_Sucursal_Semanales=df_activo.copy()
 #Nuevas selecciones de categoria
 LI_Sem=104
 LS_Sem=110
-Porc_ML=0.70
+Porc_ML=0.60
 
 His_Sucursal_Semanales['Venta Binaria']=(His_Sucursal_Semanales['ventas']>0).astype(int)
 
